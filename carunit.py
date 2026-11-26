@@ -23,13 +23,15 @@ carunit — 车机 Android 调试小工具
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # ---------------------------------------------------------------- 输出
 
@@ -54,6 +56,16 @@ def die(msg, code=1):
 
 class AdbError(RuntimeError):
     pass
+
+
+def find_adb(explicit=None):
+    if explicit:
+        return explicit
+    local_name = "adb.exe" if os.name == "nt" else "adb"
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), local_name)
+    if os.path.isfile(local_path):
+        return local_path
+    return shutil.which("adb") or "adb"
 
 
 class Adb:
@@ -161,13 +173,19 @@ def parse_install(text):
     return {"ok": ok, "message": message}
 
 
-def parse_pm_path(text):
-    """pm path <包名> 输出 -> 设备上的 apk 路径"""
+def parse_pm_paths(text):
+    """pm path <包名> 输出 -> 设备上的 base/split APK 路径列表"""
+    paths = []
     for line in (text or "").splitlines():
         line = line.strip()
         if line.startswith("package:"):
-            return line[len("package:"):].strip()
-    return None
+            path = line[len("package:"):].strip()
+            if path:
+                paths.append(path)
+    return paths
+
+
+_PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 
 
 def is_png(data):
@@ -257,10 +275,13 @@ def cmd_install(adb, args):
     if not apks:
         die("没有找到 .apk 文件")
     failed = 0
+    install_args = ["install", "-r"]
+    if args.grant_permissions:
+        install_args.append("-g")
     for apk in apks:
         log(f"安装 {os.path.basename(apk)} ...")
         try:
-            result = parse_install(adb.run("install", "-r", "-g", apk, timeout=args.timeout))
+            result = parse_install(adb.run(*install_args, apk, timeout=args.timeout))
         except AdbError as exc:
             log("  失败: " + str(exc).splitlines()[0][:200])
             failed += 1
@@ -275,35 +296,52 @@ def cmd_install(adb, args):
 
 
 def cmd_export(adb, args):
+    if not _PACKAGE_RE.fullmatch(args.package):
+        die(f"包名格式不正确: {args.package}")
     outdir = os.path.abspath(args.outdir)
     os.makedirs(outdir, exist_ok=True)
-    remote = parse_pm_path(adb.shell("pm", "path", args.package))
-    if not remote:
+    remotes = parse_pm_paths(adb.shell("pm", "path", args.package))
+    if not remotes:
         die(f"没有找到已安装的包: {args.package}（先 `carunit.py top` 确认包名）")
-    dest = os.path.join(outdir, f"{args.package}.apk")
-    adb.run("pull", remote, dest, timeout=180)
-    if not os.path.isfile(dest):
-        die("导出失败：本地没有生成文件")
-    log(f"已导出 {dest}（{os.path.getsize(dest)} 字节）")
+    if len(remotes) == 1:
+        dests = [os.path.join(outdir, f"{args.package}.apk")]
+    else:
+        package_dir = os.path.join(outdir, args.package)
+        os.makedirs(package_dir, exist_ok=True)
+        dests = [os.path.join(package_dir, os.path.basename(remote)) for remote in remotes]
+    for remote, dest in zip(remotes, dests):
+        adb.run("pull", remote, dest, timeout=180)
+        if not os.path.isfile(dest):
+            die(f"导出失败：本地没有生成文件 {dest}")
+        log(f"已导出 {dest}（{os.path.getsize(dest)} 字节）")
+    if len(remotes) > 1:
+        log(f"共导出 {len(remotes)} 个 APK（base + split）")
     return 0
 
 
 def cmd_logcat(adb, args):
+    pattern = None
+    if args.grep:
+        try:
+            pattern = re.compile(args.grep, re.I)
+        except re.error as exc:
+            die(f"--grep 正则无效: {exc}")
     target = ["logcat", "-v", "time"]
     if args.package:
         pid = adb.shell("pidof", args.package).strip().split()
         if not pid:
             die(f"{args.package} 当前不在运行（pidof 为空），先启动应用再抓")
-        adb.run("logcat", "-c")
         target += ["--pid", pid[0]]
         log(f"跟踪 {args.package} (pid {pid[0]})，采集 {args.seconds} 秒 ...")
     else:
-        adb.run("logcat", "-c")
         log(f"采集全部日志 {args.seconds} 秒 ...")
+    if args.clear:
+        adb.run("logcat", "-c")
+        log("已清空设备日志缓冲区")
     time.sleep(args.seconds)
     lines = adb.run(*(target + ["-d"]), timeout=60).splitlines()
-    if args.grep:
-        lines = [line for line in lines if re.search(args.grep, line, re.I)]
+    if pattern:
+        lines = [line for line in lines if pattern.search(line)]
     text = "\n".join(lines)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as handle:
@@ -326,40 +364,123 @@ def cmd_crash(adb, args):
 
 
 _DEBUG_SETTINGS = [
-    ("关闭窗口动画", ("settings", "put", "global", "window_animation_scale", "0")),
-    ("关闭过渡动画", ("settings", "put", "global", "transition_animation_scale", "0")),
-    ("关闭动画时长缩放", ("settings", "put", "global", "animator_duration_scale", "0")),
-    ("充电时常亮", ("svc", "power", "stayon", "true")),
-    ("屏幕超时 30 分钟", ("settings", "put", "system", "screen_off_timeout", "1800000")),
+    ("关闭窗口动画", "global", "window_animation_scale", "0", None),
+    ("关闭过渡动画", "global", "transition_animation_scale", "0", None),
+    ("关闭动画时长缩放", "global", "animator_duration_scale", "0", None),
+    ("充电时常亮", "global", "stay_on_while_plugged_in", "true", ("svc", "power", "stayon", "true")),
+    ("屏幕超时 30 分钟", "system", "screen_off_timeout", "1800000", None),
 ]
 
 
+def _setting_key(setting):
+    return f"{setting[1]}/{setting[2]}"
+
+
+def _load_setup_state(path):
+    if not os.path.exists(path):
+        return {"version": 1, "values": {}}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AdbError(f"无法读取设置备份 {path}: {exc}")
+    if not isinstance(data, dict) or not isinstance(data.get("values"), dict):
+        raise AdbError(f"设置备份格式不正确: {path}")
+    return data
+
+
+def _save_setup_state(path, state):
+    temp_path = path + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temp_path, path)
+    except OSError as exc:
+        raise AdbError(f"无法保存设置备份 {path}: {exc}")
+
+
+def _write_setting(adb, setting, value):
+    label, namespace, key, desired, custom_write = setting
+    if custom_write and str(value) == desired:
+        adb.shell(*custom_write, timeout=20)
+    else:
+        adb.shell("settings", "put", namespace, key, str(value), timeout=20)
+
+
 def cmd_setup(adb, args):
+    state_path = os.path.abspath(args.state_file)
+    state = _load_setup_state(state_path)
+    values = state["values"]
+    if args.restore:
+        if not values:
+            die(f"没有可恢复的设置备份: {state_path}")
+        failed = 0
+        for setting in _DEBUG_SETTINGS:
+            key = _setting_key(setting)
+            if key not in values:
+                continue
+            try:
+                _write_setting(adb, setting, values[key])
+                log(f"  已恢复: {setting[0]} -> {values[key]}")
+            except AdbError as exc:
+                log(f"  恢复失败: {setting[0]} -> {str(exc).splitlines()[0][:120]}")
+                failed += 1
+        return 1 if failed else 0
+
     failed = 0
-    for label, shell_args in _DEBUG_SETTINGS:
+    state_changed = False
+    for setting in _DEBUG_SETTINGS:
+        label, namespace, key, desired, custom_write = setting
+        state_key = _setting_key(setting)
         try:
-            adb.shell(*shell_args, timeout=20)
+            if state_key not in values:
+                values[state_key] = adb.shell("settings", "get", namespace, key, timeout=20).strip()
+                state_changed = True
+            if args.dry_run:
+                log(f"  [预演] {label}: {values[state_key]} -> {desired}")
+                continue
+            _write_setting(adb, setting, desired)
             log(f"  已设置: {label}")
         except AdbError as exc:
             log(f"  失败: {label} -> {str(exc).splitlines()[0][:120]}")
             failed += 1
+    if state_changed and not args.dry_run:
+        _save_setup_state(state_path, state)
+        log(f"设置备份: {state_path}")
     if failed:
         log("部分设置失败通常是车机权限限制，不影响其它功能。")
     return 1 if failed else 0
 
 
 def cmd_tcpip(adb, args):
-    adb.run("tcpip", str(args.port), timeout=30)
+    out = adb.run("tcpip", str(args.port), timeout=30)
+    if str(args.port) not in out:
+        die(f"切换无线调试失败: {out.strip() or 'adb 未返回端口信息'}")
     log(f"已切换无线调试端口 {args.port}，接着执行: carunit.py connect <车机IP>:{args.port}")
+    return 0
 
 
 def cmd_connect(adb, args):
-    out = adb.run("connect", args.address, timeout=30)
-    log(out.strip())
+    out = adb.run("connect", args.address, timeout=30).strip()
+    lowered = out.lower()
+    if not out or any(word in lowered for word in ("failed", "unable", "cannot", "error")):
+        die(f"连接失败: {out or 'adb 未返回连接结果'}")
+    log(out)
     return 0
 
 
 # ---------------------------------------------------------------- 入口
+
+
+def _port_number(value):
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("端口必须是整数")
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("端口必须在 1-65535 之间")
+    return port
 
 
 def build_parser():
@@ -367,7 +488,7 @@ def build_parser():
         prog="carunit",
         description="车机 Android 调试小工具（仅用于你拥有或已授权的设备）",
     )
-    parser.add_argument("--adb", default="adb", help="adb 可执行文件路径（默认 PATH 中的 adb）")
+    parser.add_argument("--adb", default=None, help="adb 可执行文件路径（默认先找同目录，再找 PATH）")
     parser.add_argument("--serial", default=None, help="多设备时指定序列号")
     parser.add_argument("--version", action="version", version=f"carunit {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -375,7 +496,11 @@ def build_parser():
     sub.add_parser("devices", help="列出已连接设备").set_defaults(func=cmd_devices)
     sub.add_parser("info", help="查看型号/系统/分辨率").set_defaults(func=cmd_info)
     sub.add_parser("top", help="查看当前前台应用包名").set_defaults(func=cmd_top)
-    sub.add_parser("setup", help="应用常用调试设置（动画/常亮/超时）").set_defaults(func=cmd_setup)
+    setup = sub.add_parser("setup", help="应用或恢复常用调试设置（动画/常亮/超时）")
+    setup.add_argument("--restore", action="store_true", help="从备份恢复修改前的设置")
+    setup.add_argument("--dry-run", action="store_true", help="只显示将要修改的设置")
+    setup.add_argument("--state-file", default="carunit-setup.backup.json", help="设置备份文件路径")
+    setup.set_defaults(func=cmd_setup)
     sub.add_parser("crash", help="导出崩溃缓冲区日志").set_defaults(func=cmd_crash)
 
     shot = sub.add_parser("shot", help="截图并保存到本地")
@@ -385,6 +510,7 @@ def build_parser():
     install = sub.add_parser("install", help="安装一个或多个 APK / 目录内全部 APK")
     install.add_argument("paths", nargs="+", help="APK 文件或目录")
     install.add_argument("--timeout", type=int, default=180, help="单个 APK 安装超时秒数")
+    install.add_argument("--grant-permissions", action="store_true", help="安装时自动授予运行时权限（-g）")
     install.set_defaults(func=cmd_install)
 
     export = sub.add_parser("export", help="把已安装应用的 APK 拉回本地")
@@ -396,11 +522,12 @@ def build_parser():
     logcat.add_argument("--package", help="只保留该包名进程的日志")
     logcat.add_argument("--seconds", type=int, default=10, help="采集时长秒数（默认 10）")
     logcat.add_argument("--grep", help="正则过滤，忽略大小写")
+    logcat.add_argument("--clear", action="store_true", help="采集前清空设备日志缓冲区")
     logcat.add_argument("-o", "--out", help="保存到文件而不是打印")
     logcat.set_defaults(func=cmd_logcat)
 
     tcpip = sub.add_parser("tcpip", help="切到无线调试（需先 USB 连接）")
-    tcpip.add_argument("--port", type=int, default=5555)
+    tcpip.add_argument("--port", type=_port_number, default=5555)
     tcpip.set_defaults(func=cmd_tcpip)
 
     connect = sub.add_parser("connect", help="连接无线调试地址 IP:PORT")
@@ -412,7 +539,7 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    adb = Adb(adb=args.adb, serial=args.serial)
+    adb = Adb(adb=find_adb(args.adb), serial=args.serial)
     try:
         return args.func(adb, args) or 0
     except AdbError as exc:
